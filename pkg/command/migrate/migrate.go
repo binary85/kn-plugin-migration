@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
@@ -43,7 +44,8 @@ type migrateCmdFlags struct {
 	Delete                bool
 }
 
-var MaxUpdateRetries = 3
+var MaxGetRetries = 16
+var MaxUpdateRetries = 16
 var migrateFlags migrateCmdFlags
 
 // migrateCmd represents the migrate command
@@ -93,7 +95,7 @@ func NewMigrateCommand() *cobra.Command {
 			}
 
 			// For source
-			_, migrationClientS, err := getClients(kubeconfigS, namespaceS)
+			clientSetS, migrationClientS, err := getClients(kubeconfigS, namespaceS)
 			if err != nil {
 				fmt.Printf(err.Error())
 				os.Exit(1)
@@ -135,6 +137,23 @@ func NewMigrateCommand() *cobra.Command {
 			}
 			for i := 0; i < len(servicesS.Items); i++ {
 				serviceS := servicesS.Items[i]
+				fmt.Println("Start migrate service", color.CyanString(serviceS.Name))
+
+				configmapS, err := getConfigmap(clientSetS, namespaceS, generateConfigmapName(serviceS.Name))
+				if err != nil && !api_errors.IsNotFound(err) {
+					fmt.Printf(err.Error())
+					os.Exit(1)
+				}
+				if configmapS != nil {
+					err := createConfigmap(clientSetD, namespaceD, configmapS)
+					if err != nil {
+						fmt.Printf(err.Error())
+						os.Exit(1)
+					}
+					fmt.Println("Migrated configmap", color.CyanString(generateConfigmapName(serviceS.Name)), "Successfully")
+				} else {
+					fmt.Printf("no configmap for service %s, skip migrate configmap\n", serviceS.Name)
+				}
 				err = createService(migrationClientD, serviceS, migrateFlags.Force)
 				if err != nil {
 					fmt.Printf(err.Error())
@@ -148,13 +167,15 @@ func NewMigrateCommand() *cobra.Command {
 					os.Exit(1)
 				}
 
-				config, err := migrationClientD.GetConfig(serviceD.Name)
+				//fmt.Printf("try get configuration for migrate revisions: s: %s, d:%s\n", serviceS.Name, serviceD.Name)
+				config, err := getConfig(migrationClientD, serviceD.Name)
 				if err != nil {
 					fmt.Printf(err.Error())
 					os.Exit(1)
 				}
-				configUuid := config.UID
+				configUUID := config.UID
 
+				//fmt.Printf("try list source revisions: s: %s\n", serviceS.Name)
 				revisionsS, err := migrationClientS.ListRevisionByService(serviceS.Name)
 				if err != nil {
 					fmt.Printf(err.Error())
@@ -162,11 +183,13 @@ func NewMigrateCommand() *cobra.Command {
 				}
 				for i := 0; i < len(revisionsS.Items); i++ {
 					revisionS := revisionsS.Items[i]
-					err = migrateRevision(migrationClientD, revisionS, serviceS, configUuid)
+					//fmt.Printf("migrate revision: source: %s/%s\n", revisionS.Namespace, revisionS.Name)
+					err = migrateRevision(migrationClientD, revisionS, serviceS, configUUID, serviceD.Status.LatestCreatedRevisionName)
 					if err != nil {
 						fmt.Printf(err.Error())
 						os.Exit(1)
 					}
+					time.Sleep(5 * time.Second)
 				}
 				fmt.Println("")
 			}
@@ -237,6 +260,34 @@ func getOrCreateNamespace(clientSet *kubernetes.Clientset, namespace string) err
 	return nil
 }
 
+func getConfigmap(clientSet *kubernetes.Clientset, namespace, configmapName string) (*apiv1.ConfigMap, error) {
+	cm, err := clientSet.CoreV1().ConfigMaps(namespace).Get(context.TODO(), configmapName, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	return cm, nil
+}
+
+func createConfigmap(clientSet *kubernetes.Clientset, namespace string, configmap *apiv1.ConfigMap) error {
+	cm := apiv1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ConfigMap",
+			APIVersion: "v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        configmap.Name,
+			Namespace:   namespace,
+			Labels:      configmap.Labels,
+			Annotations: configmap.Annotations,
+		},
+		Data: configmap.Data,
+	}
+
+	_, err := clientSet.CoreV1().ConfigMaps(namespace).Create(context.TODO(), &cm, metav1.CreateOptions{})
+	return err
+}
+
 func createService(migrationClient command.MigrationClient, service serving_v1_api.Service, force bool) error {
 	serviceExists, err := migrationClient.ServiceExists(service.Name)
 	if err != nil {
@@ -281,27 +332,39 @@ func deleteAllServices(migrationClient command.MigrationClient, delete bool) err
 	return nil
 }
 
-func migrateRevision(migrationClient command.MigrationClient, revisionS serving_v1_api.Revision, serviceS serving_v1_api.Service, configUuid types.UID) error {
-	if revisionS.Name != serviceS.Status.LatestReadyRevisionName {
+func migrateRevision(migrationClient command.MigrationClient, revisionS serving_v1_api.Revision, serviceS serving_v1_api.Service, configUuid types.UID, latestCreatedRevisionName string) error {
+	// change configuration
+
+	if revisionS.Name != latestCreatedRevisionName {
 		_, err := migrationClient.CreateRevision(&revisionS, configUuid)
 		if err != nil {
 			return err
 		}
 		fmt.Println("Migrated revision", color.CyanString(revisionS.Name), "successfully")
 	} else {
-		retries := 0
+		getRetries := 0
+		updateRetries := 0
 		for {
 			revision, err := migrationClient.GetRevision(revisionS.Name)
 			if err != nil {
+				if api_errors.IsNotFound(err) && getRetries < MaxGetRetries {
+					fmt.Printf("retry to get revision(%s) after 1sec(try#: %d)\n", revisionS.Name, getRetries)
+					getRetries++
+					time.Sleep(time.Second)
+					continue
+				}
 				return err
 			}
+
 			sourceRevisionGeneration := revisionS.ObjectMeta.Labels["serving.knative.dev/configurationGeneration"]
 			revision.ObjectMeta.Labels["serving.knative.dev/configurationGeneration"] = sourceRevisionGeneration
+
 			err = migrationClient.UpdateRevision(revision)
 			if err != nil {
 				// Retry to update when a resource version conflict exists
-				if api_errors.IsConflict(err) && retries < MaxUpdateRetries {
-					retries++
+				if api_errors.IsConflict(err) && updateRetries < MaxUpdateRetries {
+					fmt.Printf("retry to update revision(%s) after 1sec(try#: %d)\n", revisionS.Name, updateRetries)
+					updateRetries++
 					continue
 				}
 				return err
@@ -311,4 +374,25 @@ func migrateRevision(migrationClient command.MigrationClient, revisionS serving_
 		}
 	}
 	return nil
+}
+
+func getConfig(migrationClient command.MigrationClient, serviceName string) (*serving_v1_api.Configuration, error) {
+	retries := 0
+	for {
+		config, err := migrationClient.GetConfig(serviceName)
+		if err != nil {
+			if api_errors.IsNotFound(err) && retries < MaxGetRetries {
+				fmt.Printf(err.Error())
+				fmt.Printf(" retry after 1sec(try#: %d)\n", retries+1)
+				time.Sleep(time.Second)
+				continue
+			}
+			return nil, err
+		}
+		return config, nil
+	}
+}
+
+func generateConfigmapName(serviceName string) string {
+	return fmt.Sprintf("%s-config", serviceName)
 }
